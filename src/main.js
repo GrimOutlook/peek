@@ -1,14 +1,29 @@
 const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, shell, dialog, Notification, session, globalShortcut } = require('electron')
 const path = require('path')
 const fs = require('fs')
-const { spawn, execFileSync } = require('child_process')
 const mqtt = require('mqtt')
 const { readConfig, saveConfig } = require('./config')
 const { readPrefs, writePrefs } = require('./prefs')
-const updater = require('./updater')
+const security = require('./security')
 const frigateAuth = require('./frigate-auth')
 
+process.umask(0o077)
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
+// Validate both the WebContents and its main frame for every IPC channel.
+function ipcWindow(channel) {
+  if (channel.startsWith('setup-')) return [setupWin, 'setup/setup.html']
+  if (channel.startsWith('update-')) return [updateWin, 'update/update.html']
+  return [win, 'renderer/index.html']
+}
+for (const method of ['on', 'handle']) {
+  const register = ipcMain[method].bind(ipcMain)
+  ipcMain[method] = (channel, listener) => register(channel, (event, ...args) => {
+    const [window, file] = ipcWindow(channel)
+    if (!security.trustedSender(event, window, path.join(__dirname, file))) throw new Error('Untrusted IPC sender')
+    return listener(event, ...args)
+  })
+}
 
 const gotInstanceLock = app.requestSingleInstanceLock()
 if (!gotInstanceLock) {
@@ -29,7 +44,6 @@ let appStarted = false
 let placementMode = false
 let dynamicAspect = null
 let scaleSaveTimer = null
-let frigatePin = null
 let frigateToken = null
 let tokenRefreshTimer = null
 let mqttClient = null
@@ -38,15 +52,14 @@ let reauthInFlight = false
 let lastReauthAttempt = 0
 let cameraStreamMap = {}
 let cameraDetectMap = {}
-let certProcSet = false
 let liveView = null
 let registeredHotkey = null
 let resumeTimer = null
 const knownCameras = new Set()
 const knownAudioLabels = new Set()
-const activeAudio = new Set()
-const stationaryEvents = new Set()
-const zoneEvents = new Set()
+const activeAudio = new security.BoundedSet()
+const stationaryEvents = new security.BoundedSet()
+const zoneEvents = new security.BoundedSet()
 const knownZones = new Map()
 const knownObjectLabels = new Set()
 const AUDIO_NON_LABELS = new Set(['all', 'dBFS', 'rms', 'transcription', 'set', 'state'])
@@ -322,6 +335,7 @@ function createWindow() {
     backgroundColor: '#00000000',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false
@@ -329,6 +343,7 @@ function createWindow() {
   })
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  security.hardenWindow(win)
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'))
   positionWindow()
 }
@@ -378,7 +393,7 @@ function loadPrefs() {
     showBoundingBoxes: saved.showBoundingBoxes != null ? saved.showBoundingBoxes : base.showBoundingBoxes,
     dynamicSize: saved.dynamicSize != null ? saved.dynamicSize : base.dynamicSize,
     dismissOnStationary: saved.dismissOnStationary != null ? saved.dismissOnStationary : base.dismissOnStationary,
-    autoUpdate: saved.autoUpdate != null ? saved.autoUpdate : base.autoUpdate,
+    autoUpdate: false,
     showDock: saved.showDock != null ? saved.showDock : base.showDock,
     openAtLogin: saved.openAtLogin != null ? saved.openAtLogin : base.openAtLogin,
     liveHotkey: typeof saved.liveHotkey === 'string' ? saved.liveHotkey : base.liveHotkey,
@@ -611,21 +626,22 @@ function revealOverlay() {
 }
 
 function learnCamera(camera) {
-  if (knownCameras.has(camera)) return
+  if (!security.identifier(camera) || knownCameras.has(camera) || knownCameras.size >= security.MAX_STATE) return
   knownCameras.add(camera)
   if (prefs.cameras[camera] == null) prefs.cameras[camera] = true
   buildMenu()
 }
 
 function learnAudioLabel(label) {
-  if (knownAudioLabels.has(label)) return
+  if (!security.identifier(label) || knownAudioLabels.has(label) || knownAudioLabels.size >= security.MAX_STATE) return
   knownAudioLabels.add(label)
   if (prefs.audioLabels[label] == null) prefs.audioLabels[label] = true
   buildMenu()
 }
 
 function learnZone(zone, camera) {
-  if (typeof zone !== 'string' || !zone) return
+  if (!security.identifier(zone)) return
+  if (!knownZones.has(zone.toLowerCase()) && knownZones.size >= security.MAX_STATE) return
   const key = zone.toLowerCase()
   let entry = knownZones.get(key)
   let changed = false
@@ -637,7 +653,7 @@ function learnZone(zone, camera) {
     entry.name = zone
     changed = true
   }
-  if (camera && !entry.cameras.has(camera)) {
+  if (security.identifier(camera) && entry.cameras.size < security.MAX_STATE && !entry.cameras.has(camera)) {
     entry.cameras.add(camera)
     changed = true
   }
@@ -654,7 +670,7 @@ function zoneLabel(key) {
 function learnObjectLabel(label) {
   if (typeof label !== 'string' || !label) return
   const key = label.toLowerCase()
-  if (knownObjectLabels.has(key)) return
+  if (!security.identifier(label) || knownObjectLabels.has(key) || knownObjectLabels.size >= security.MAX_STATE) return
   knownObjectLabels.add(key)
   buildMenu()
 }
@@ -893,9 +909,10 @@ function buildMenu() {
     {
       label: 'Check on launch',
       type: 'checkbox',
-      checked: prefs.autoUpdate,
+      checked: false,
+      enabled: false,
       click: (item) => {
-        prefs.autoUpdate = item.checked
+        prefs.autoUpdate = false
         savePrefs()
       }
     },
@@ -920,6 +937,7 @@ function createTray() {
 
 function handleEvent(data) {
   if (placementMode) return
+  if (!security.validEvent(data)) return
   const after = data.after || data.before
   if (!after || !after.label) return
 
@@ -1027,6 +1045,7 @@ function emitAudioEvent(type, camera, label) {
 }
 
 function handleAudioState(camera, label, on) {
+  if (!security.identifier(camera) || !security.identifier(label)) return
   learnCamera(camera)
   learnAudioLabel(label)
   const key = `${camera}/${label}`
@@ -1042,6 +1061,7 @@ function handleAudioState(camera, label, on) {
 }
 
 function startMqtt() {
+  security.validateConfig(config)
   const prefix = config.topicPrefix || 'frigate'
   const availableTopic = `${prefix}/available`
   mqttClient = mqtt.connect(config.mqtt, { reconnectPeriod: 3000 })
@@ -1050,7 +1070,10 @@ function startMqtt() {
     mqttClient.subscribe(availableTopic)
     mqttClient.subscribe(`${prefix}/+/audio/+`)
   })
+  mqttClient.on('error', () => console.error('[peek] MQTT connection failed'))
   mqttClient.on('message', (topic, payload) => {
+    if (payload.length > security.MAX_PAYLOAD) return
+    try {
     if (topic === availableTopic) {
       handleFrigateAvailability(payload.toString())
       return
@@ -1066,7 +1089,8 @@ function startMqtt() {
     } catch (err) {
       return
     }
-    handleEvent(data)
+    if (security.validEvent(data)) handleEvent(data)
+    } catch { console.error('[peek] rejected malformed MQTT message') }
   })
 }
 
@@ -1074,25 +1098,6 @@ function handleFrigateAvailability(status) {
   const wasAvailable = frigateAvailable
   frigateAvailable = status === 'online'
   if (frigateAvailable && !wasAvailable) requestReauth()
-}
-
-function applyCertPin() {
-  if (certProcSet) return
-  certProcSet = true
-  session.defaultSession.setCertificateVerifyProc((request, callback) => {
-    if (frigatePin && request.hostname === frigatePin.host) {
-      if (frigatePin.certSha256 == null) {
-        callback(0)
-        return
-      }
-      const sha = frigateAuth.pemToDerSha256(request.certificate && request.certificate.data)
-      if (sha && sha === frigatePin.certSha256) {
-        callback(0)
-        return
-      }
-    }
-    callback(-3)
-  })
 }
 
 function parseJwtExp(token) {
@@ -1116,19 +1121,11 @@ function scheduleTokenRefresh(token) {
 
 async function initFrigateAuth() {
   if (!config || !frigateAuth.isHttps(config.frigateUrl)) return true
-  const allowSelfSigned = !!config.frigateAllowSelfSigned
-  if (!config.frigateUser) {
-    if (allowSelfSigned) {
-      frigatePin = { host: new URL(config.frigateUrl).hostname, certSha256: null }
-      applyCertPin()
-    }
-    return true
-  }
+  const allowSelfSigned = false
+  if (!config.frigateUser) return true
   try {
     const { token, certSha256 } = await frigateAuth.login(config.frigateUrl, config.frigateUser, config.frigatePassword, allowSelfSigned)
     frigateToken = token
-    frigatePin = { host: new URL(config.frigateUrl).hostname, certSha256 }
-    applyCertPin()
     await session.defaultSession.cookies.set({
       url: config.frigateUrl,
       name: 'frigate_token',
@@ -1197,10 +1194,12 @@ function openSetup() {
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'setup-preload.js'),
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false
     }
   })
+  security.hardenWindow(setupWin)
   setupWin.loadFile(path.join(__dirname, 'setup', 'setup.html'))
   setupWin.once('ready-to-show', () => setupWin.show())
   setupWin.on('closed', () => {
@@ -1240,6 +1239,7 @@ function testMqtt(cfg) {
 }
 
 async function testConnection(cfg) {
+  try { security.validateConfig(cfg) } catch (err) { return { ok: false, error: err.message } }
   const mqttRes = await testMqtt(cfg)
   if (!mqttRes.ok) return mqttRes
   if (cfg.frigateUser && frigateAuth.isHttps(cfg.frigateUrl)) {
@@ -1261,174 +1261,14 @@ async function testConnection(cfg) {
   return mqttRes
 }
 
-function openUpdateWindow() {
-  if (updateWin && !updateWin.isDestroyed()) {
-    updateWin.focus()
-    return
-  }
-  updateWin = new BrowserWindow({
-    width: 520,
-    height: 560,
-    resizable: false,
-    fullscreenable: false,
-    maximizable: false,
-    title: 'Update Peek',
-    show: false,
-    webPreferences: {
-      preload: path.join(__dirname, 'update-preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  })
-  updateWin.loadFile(path.join(__dirname, 'update', 'update.html'))
-  updateWin.once('ready-to-show', () => updateWin.show())
-  updateWin.on('closed', () => { updateWin = null })
-}
-
-const NOTIFY_THROTTLE_MS = 24 * 60 * 60 * 1000
-
 async function checkForUpdates(manual) {
-  let latest
-  try {
-    latest = await updater.getLatest()
-  } catch (err) {
-    if (manual) {
-      dialog.showMessageBox({ type: 'error', title: 'Peek', message: 'Could not check for updates.', detail: err.message })
-    }
-    return
-  }
-  const current = app.getVersion()
-  if (!updater.isNewer(latest.version, current)) {
-    if (manual) {
-      dialog.showMessageBox({ type: 'info', title: 'Peek', message: 'You are up to date.', detail: 'Peek ' + current + ' is the latest version.' })
-    }
-    return
-  }
-  const asset = updater.pickAsset(latest.assets, process.platform)
-  pendingUpdate = {
-    current,
-    version: latest.version,
-    notes: latest.notes,
-    platform: process.platform,
-    asset: asset
-  }
-  if (manual) {
-    openUpdateWindow()
-    return
-  }
-  const now = Date.now()
-  if (!updater.shouldNotify(prefs, latest.version, now, NOTIFY_THROTTLE_MS)) {
-    return
-  }
-  prefs.lastNotify = { version: latest.version, at: now }
-  savePrefs()
-  notifyUpdate(latest.version)
-}
-
-function notifyUpdate(version) {
-  if (!Notification.isSupported()) {
-    openUpdateWindow()
-    return
-  }
-  const note = new Notification({
-    title: 'Update available',
-    body: 'Peek ' + version + ' is ready. Click to see what’s new.'
-  })
-  note.on('click', () => openUpdateWindow())
-  note.show()
-}
-
-function runInstaller(file, mode) {
-  if (process.platform === 'win32') {
-    const child = spawn(file, mode === 'silent' ? ['/S'] : [], { detached: true, stdio: 'ignore' })
-    child.unref()
-    setTimeout(() => app.quit(), 800)
-  } else {
-    shell.openPath(file)
-  }
-}
-
-function shellQuote(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'"
-}
-
-function installMacUpdate(zipPath) {
-  const appBundle = path.resolve(app.getPath('exe'), '..', '..', '..')
-  if (!/\.app$/.test(appBundle)) {
-    return { error: 'Could not locate the app bundle.' }
-  }
-  const parent = path.dirname(appBundle)
-  try {
-    fs.accessSync(parent, fs.constants.W_OK)
-  } catch (err) {
-    shell.showItemInFolder(zipPath)
-    return { error: 'Cannot update in place here. The download was revealed in Finder so you can replace Peek manually.' }
-  }
-  const work = path.join(app.getPath('temp'), 'peek-update-' + process.pid)
-  let newApp
-  try {
-    fs.rmSync(work, { recursive: true, force: true })
-    fs.mkdirSync(work, { recursive: true })
-    execFileSync('ditto', ['-x', '-k', zipPath, work])
-    newApp = path.join(work, path.basename(appBundle))
-    if (!fs.existsSync(newApp)) {
-      return { error: 'Update package did not contain the app.' }
-    }
-    execFileSync('xattr', ['-cr', newApp])
-    execFileSync('codesign', ['--force', '--deep', '--sign', '-', newApp])
-  } catch (err) {
-    return { error: 'Could not prepare the update: ' + err.message }
-  }
-  const script = [
-    '#!/bin/bash',
-    'PID=' + process.pid,
-    'APP=' + shellQuote(appBundle),
-    'NEW=' + shellQuote(newApp),
-    'STAGE="$APP.update"',
-    'BACKUP="$APP.old"',
-    'while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done',
-    'rm -rf "$STAGE" "$BACKUP"',
-    'if ! ditto "$NEW" "$STAGE"; then exit 1; fi',
-    'mv "$APP" "$BACKUP"',
-    'if ! mv "$STAGE" "$APP"; then mv "$BACKUP" "$APP"; exit 1; fi',
-    'xattr -cr "$APP" || true',
-    'rm -rf "$BACKUP" ' + shellQuote(work),
-    'open "$APP"',
-    ''
-  ].join('\n')
-  const scriptPath = path.join(app.getPath('temp'), 'peek-update-' + process.pid + '.sh')
-  try {
-    fs.writeFileSync(scriptPath, script, { mode: 0o755 })
-  } catch (err) {
-    return { error: 'Could not stage the update: ' + err.message }
-  }
-  const child = spawn('/bin/bash', [scriptPath], { detached: true, stdio: 'ignore' })
-  child.unref()
-  setTimeout(() => app.quit(), 400)
-  return { ok: true }
-}
-
-async function installUpdate(mode) {
-  if (!pendingUpdate || !pendingUpdate.asset) {
-    return { error: 'No matching download for this platform.' }
-  }
-  const dest = path.join(app.getPath('temp'), pendingUpdate.asset.name)
-  try {
-    await updater.download(pendingUpdate.asset.url, dest, (p) => {
-      if (updateWin && !updateWin.isDestroyed()) updateWin.webContents.send('update-progress', p)
-    })
-  } catch (err) {
-    return { error: 'Download failed: ' + err.message }
-  }
-  if (process.platform === 'darwin' && app.isPackaged && /\.zip$/i.test(dest)) {
-    return installMacUpdate(dest)
-  }
-  runInstaller(dest, mode)
-  return { ok: true }
+  if (manual) dialog.showMessageBox({ type: 'info', title: 'Peek', message: 'Updates are managed by your package manager.' })
 }
 
 app.whenReady().then(() => {
   if (!gotInstanceLock) return
+  session.defaultSession.setPermissionRequestHandler((wc, permission, callback) => callback(false))
+  session.defaultSession.setPermissionCheckHandler(() => false)
   if (process.platform === 'darwin' && app.dock && !readPrefs().showDock) app.dock.hide()
 
   const { powerMonitor } = require('electron')
@@ -1449,7 +1289,7 @@ app.whenReady().then(() => {
     requestReauth()
   })
   ipcMain.on('overlay-open-url', (e, url) => {
-    if (typeof url === 'string' && config && config.frigateUrl && url.startsWith(config.frigateUrl)) {
+    if (typeof url === 'string' && config && security.sameOriginUrl(url, config.frigateUrl)) {
       shell.openExternal(url)
     }
   })
@@ -1501,14 +1341,15 @@ app.whenReady().then(() => {
     }
   })
   ipcMain.handle('setup-save', (e, cfg, opts) => {
+    security.validateConfig(cfg)
     saveConfig(cfg)
-    const wantUpdates = !!(opts && opts.autoUpdate)
+    const wantUpdates = false
     const wantDock = !!(opts && opts.showDock)
     const wantOpenAtLogin = !!(opts && opts.openAtLogin)
     if (!appStarted) {
       config = cfg
       startApp()
-      prefs.autoUpdate = wantUpdates
+      prefs.autoUpdate = false
       prefs.showDock = wantDock
       prefs.openAtLogin = wantOpenAtLogin
       savePrefs()
@@ -1527,7 +1368,7 @@ app.whenReady().then(() => {
         config.frigatePassword !== cfg.frigatePassword ||
         !!config.frigateAllowSelfSigned !== !!cfg.frigateAllowSelfSigned
       const wasUpdates = !!prefs.autoUpdate
-      prefs.autoUpdate = wantUpdates
+      prefs.autoUpdate = false
       prefs.showDock = wantDock
       prefs.openAtLogin = wantOpenAtLogin
       applyRuntimePrefs(opts)
@@ -1563,7 +1404,7 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('update-data', () => pendingUpdate)
-  ipcMain.handle('update-install', (e, mode) => installUpdate(mode))
+  ipcMain.handle('update-install', () => ({ error: 'Use your package manager' }))
   ipcMain.on('update-later', () => {
     if (updateWin && !updateWin.isDestroyed()) updateWin.close()
   })

@@ -34,13 +34,13 @@
         </div>
       </div>
       <label class="check">
-        <input id="frigateHttps" type="checkbox" />
+        <input id="frigateHttps" type="checkbox" checked disabled />
         <span class="check-text">Connect over HTTPS (TLS)</span>
         <span class="info" tabindex="0">i<span class="tip">Use this when Frigate is served over HTTPS, e.g. behind a reverse proxy on port 443, or on the authenticated port 8971.</span></span>
       </label>
       <label class="check" id="selfSignedRow">
-        <input id="frigateSelfSigned" type="checkbox" />
-        <span class="check-text">Allow self-signed certificate</span>
+        <input id="frigateSelfSigned" type="checkbox" disabled />
+        <span class="check-text">Certificate verification is mandatory; install your CA in the system trust store.</span>
         <span class="info" tabindex="0">i<span class="tip">Only needed when Frigate uses a certificate your system does not trust. Certificates from a certificate authority such as Let's Encrypt are verified normally and do not need this.</span></span>
       </label>
       <div class="row split">
@@ -58,6 +58,9 @@
 
     <section>
       <h2>MQTT broker</h2>
+      <label for="mqttScheme">Transport</label>
+      <select id="mqttScheme"><option value="mqtts">TLS</option><option value="mqtt">Loopback encrypted tunnel only</option></select>
+      <p class="hint">Use a dedicated per-device read-only broker identity. Never reuse the Frigate service account.</p>
       <div class="row split">
         <div>
           <label for="mqttHost">Host</label>
@@ -65,7 +68,7 @@
         </div>
         <div>
           <label for="mqttPort">Port</label>
-          <input id="mqttPort" type="text" placeholder="1883" />
+          <input id="mqttPort" type="text" placeholder="8883" />
         </div>
       </div>
       <div class="row split">
@@ -162,8 +165,8 @@
     <section>
       <h2>Updates</h2>
       <label class="check">
-        <input id="autoUpdate" type="checkbox" />
-        <span class="check-text">Check for updates on launch and notify me</span>
+        <input id="autoUpdate" type="checkbox" disabled />
+        <span class="check-text">Updates are managed exclusively by your package manager.</span>
         <span class="info" tabindex="0">i<span class="tip">When enabled, Peek connects to GitHub over the internet to check for a new version. Leave this off to keep Peek fully local, with no external connection. You can still check manually anytime from the menu.</span></span>
       </label>
       <label class="check" id="startupRow">

@@ -7,6 +7,7 @@ const fields = {
   frigateUser: el('frigateUser'),
   frigatePass: el('frigatePass'),
   corner: el('corner'),
+  mqttScheme: el('mqttScheme'),
   mqttHost: el('mqttHost'),
   mqttPort: el('mqttPort'),
   mqttUser: el('mqttUser'),
@@ -36,7 +37,8 @@ function parseMqtt(url) {
     const u = new URL(url)
     return {
       host: u.hostname,
-      port: u.port || '1883',
+      scheme: u.protocol.replace(':', ''),
+      port: u.port || (u.protocol === 'mqtts:' ? '8883' : '1883'),
       user: decodeURIComponent(u.username || ''),
       pass: decodeURIComponent(u.password || '')
     }
@@ -60,7 +62,7 @@ function buildConfig() {
   const useHttps = fields.frigateHttps.checked
   const frigatePort = fields.frigatePort.value.trim() || (useHttps ? '443' : '5000')
   const mqttHost = (fields.mqttHost.value.trim() || frigateHost).replace(/^\w+:\/\//, '')
-  const mqttPort = fields.mqttPort.value.trim() || '1883'
+  const mqttPort = fields.mqttPort.value.trim() || (fields.mqttScheme.value === 'mqtts' ? '8883' : '1883')
   const user = fields.mqttUser.value.trim()
   const pass = fields.mqttPass.value
 
@@ -71,7 +73,7 @@ function buildConfig() {
   const scheme = useHttps ? 'https' : 'http'
 
   const cfg = Object.assign({}, base, {
-    mqtt: `mqtt://${auth}${mqttHost}:${mqttPort}`,
+    mqtt: `${fields.mqttScheme.value}://${auth}${mqttHost}:${mqttPort}`,
     frigateUrl: `${scheme}://${frigateHost}:${frigatePort}`,
     topicPrefix: base.topicPrefix || 'frigate',
     cameras: base.cameras || {},
@@ -390,10 +392,11 @@ async function init() {
     const m = parseMqtt(existing.mqtt || '')
     fields.frigateHost.value = f.host
     fields.frigatePort.value = f.port
-    fields.frigateHttps.checked = !!f.https
-    fields.frigateSelfSigned.checked = !!existing.frigateAllowSelfSigned
+    fields.frigateHttps.checked = true
+    fields.frigateSelfSigned.checked = false
     fields.frigateUser.value = existing.frigateUser || ''
     fields.frigatePass.value = existing.frigatePassword || ''
+    fields.mqttScheme.value = m.scheme || 'mqtts'
     fields.mqttHost.value = m.host
     fields.mqttPort.value = m.port
     fields.mqttUser.value = m.user

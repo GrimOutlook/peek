@@ -1,6 +1,8 @@
 const fs = require('fs')
 const path = require('path')
 const { app } = require('electron')
+const { readPrivateJson, writePrivateJson } = require('./private-json')
+const { validateConfig } = require('./security')
 
 function configPath() {
   return path.join(app.getPath('userData'), 'config.json')
@@ -9,9 +11,7 @@ function configPath() {
 function candidatePaths() {
   return [
     process.env.FRIGATE_OVERLAY_CONFIG,
-    configPath(),
-    path.join(process.cwd(), 'config.json'),
-    path.join(__dirname, '..', 'config.json')
+    configPath()
   ].filter(Boolean)
 }
 
@@ -27,19 +27,20 @@ function loadConfig() {
   if (!file) {
     throw new Error('config.json not found. Copy config.example.json to config.json and edit it.')
   }
-  return JSON.parse(fs.readFileSync(file, 'utf8'))
+  return validateConfig(readPrivateJson(file))
 }
 
 function readConfig() {
   try {
     return loadConfig()
   } catch (err) {
+    console.error('[peek] configuration rejected: ' + err.message)
     return null
   }
 }
 
 function saveConfig(data) {
-  fs.writeFileSync(configPath(), JSON.stringify(data, null, 2))
+  writePrivateJson(configPath(), validateConfig(data))
 }
 
 module.exports = { loadConfig, readConfig, saveConfig, configPath, findConfig }

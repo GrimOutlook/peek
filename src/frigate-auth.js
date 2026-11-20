@@ -29,7 +29,7 @@ function certErrorText(err) {
   if (code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
       code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
       code === 'SELF_SIGNED_CERT_IN_CHAIN') {
-    return 'Frigate certificate is not trusted by this system. Enable "Allow self-signed certificate" if this is expected.'
+    return 'Frigate certificate is not trusted by this system. Install the issuing CA in the system trust store.'
   }
   if (code === 'CERT_HAS_EXPIRED') {
     return 'Frigate certificate has expired.'
@@ -42,6 +42,7 @@ function certErrorText(err) {
 
 function login(frigateUrl, user, password, allowSelfSigned) {
   return new Promise((resolve, reject) => {
+    if (!isHttps(frigateUrl) || allowSelfSigned) return reject(new Error('Verified HTTPS is required'))
     let u
     try {
       u = new URL(frigateUrl)
@@ -59,7 +60,7 @@ function login(frigateUrl, user, password, allowSelfSigned) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body)
       },
-      rejectUnauthorized: !allowSelfSigned
+      rejectUnauthorized: true
     }, (res) => {
       let certSha256 = null
       try {
@@ -95,6 +96,7 @@ function login(frigateUrl, user, password, allowSelfSigned) {
 
 function fetchConfig(frigateUrl, token, allowSelfSigned) {
   return new Promise((resolve, reject) => {
+    if (!isHttps(frigateUrl) || allowSelfSigned) return reject(new Error('Verified HTTPS is required'))
     let u
     try {
       u = new URL(frigateUrl)
@@ -110,10 +112,15 @@ function fetchConfig(frigateUrl, token, allowSelfSigned) {
       path: '/api/config',
       method: 'GET',
       headers: token ? { Cookie: 'frigate_token=' + token } : {},
-      rejectUnauthorized: !allowSelfSigned
+      rejectUnauthorized: true
     }, (res) => {
       const chunks = []
-      res.on('data', (c) => chunks.push(c))
+      let size = 0
+      res.on('data', (c) => {
+        size += c.length
+        if (size > 1024 * 1024) { req.destroy(new Error('Frigate config too large')); return }
+        chunks.push(c)
+      })
       res.on('end', () => {
         try {
           resolve(JSON.parse(Buffer.concat(chunks).toString()))

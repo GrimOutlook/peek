@@ -36,8 +36,14 @@ const placementLock = document.getElementById('placement-lock')
 const placementCancel = document.getElementById('placement-cancel')
 const gridEl = document.getElementById('grid')
 
-const activeEvents = new Map()
-const colorMap = new Map()
+class BoundedMap extends Map {
+  set(key, value) {
+    if (!this.has(key) && this.size >= 256) this.delete(this.keys().next().value)
+    return super.set(key, value)
+  }
+}
+const activeEvents = new BoundedMap()
+const colorMap = new BoundedMap()
 let colorIndex = 0
 let activeStreamUrl = null
 let activeClickUrl = null

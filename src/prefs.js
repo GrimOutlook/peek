@@ -1,6 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const { app } = require('electron')
+const { readPrivateJson, writePrivateJson } = require('./private-json')
 
 function prefsPath() {
   return path.join(app.getPath('userData'), 'preferences.json')
@@ -8,7 +9,7 @@ function prefsPath() {
 
 function readPrefs() {
   try {
-    return JSON.parse(fs.readFileSync(prefsPath(), 'utf8'))
+    return readPrivateJson(prefsPath())
   } catch (err) {
     return {}
   }
@@ -16,7 +17,7 @@ function readPrefs() {
 
 function writePrefs(prefs) {
   try {
-    fs.writeFileSync(prefsPath(), JSON.stringify(prefs, null, 2))
+    writePrivateJson(prefsPath(), prefs)
   } catch (err) {}
 }
 
